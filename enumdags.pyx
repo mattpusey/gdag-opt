@@ -10,6 +10,14 @@ import itertools, multiprocessing
 from bitfuncs import *
 from closure import *
 
+from libc.stdlib cimport malloc, free
+from libc.string cimport memset
+
+cdef extern from *:
+    int _ctz "__builtin_ctzll" (unsigned long long)
+
+
+_closure_cache = {}
 
 cdef bint trystrat(int n, int obs, strat, substrat, dec_nodes, np,
         int not_dec_nodes, downstream, iobs):
@@ -82,8 +90,15 @@ def isclassical(int n, par, int obs):
     obs -- bitstring of observable nodes
     """
 
-    idag = dag_indeps(par)
-    cdag = closure(idag)
+    # closure(dag_indeps(par)) is independent of obs, and many GDAGs
+    # share a parent structure, so cache it by par
+    key = tuple(par)
+    cdag = _closure_cache.get(key)
+    if cdag is None:
+        if len(_closure_cache) >= 4096:
+            _closure_cache.clear()
+        cdag = closure(dag_indeps(key))
+        _closure_cache[key] = cdag
     iobs = observable_indeps(cdag, obs)
 
     cdef int i, ibit, u_roots, ipar, i_is_obs, consider
@@ -183,26 +198,6 @@ cdef inline int applyperm(perm, int x):
         if ((1<<j) & x):
             y |= (1<<i)
     return y
-
-cdef inline bint donethis(int n, par, int obs, done):
-    """Is a GDAG isomorphic to (n, par, obs) in done?"""
-    cdef int new, old, oldbit, newbit, newobs, newnode, oldnode
-    newpartemplate = [0 for newnode in range(n)]
-    for i in itertools.permutations(range(n)):
-        newpar = newpartemplate[:]
-        newobs = 0
-        for new,old in enumerate(i):
-            oldbit = 1<<old
-            newbit = 1<<new
-            for newnode, oldnode in enumerate(i):
-                if oldbit & par[oldnode]:
-                    newpar[newnode] |= newbit
-            if oldbit & obs:
-                newobs |= newbit
-
-        if (tuple(newpar), newobs) in done:
-            return True
-    return False
 
 def irreducible(n, par, obs):
     """Is (n, par, obs) worth listing after considernig reducibility?
@@ -319,60 +314,125 @@ def find_candidates(int n, bint irrcheck):
               also unobserved
 
     It is worth checking for a few reducibilities now since it avoids
-    expensive isomorphism tests for obviously uninteresting GDAGs"""
+    expensive isomorphism tests for obviously uninteresting GDAGs
+
+    A GDAG is packed into a single integer key: bit n + j*(j-1)/2 + k
+    set means k is a parent of j (the layout the loop over i already
+    enumerates), and the low n bits are obs. done is a flat bitmap
+    over keys, so the duplicate check is one bit test. When a new
+    GDAG is found, every permuted form of it is marked in done, using
+    precomputed tables of where each key bit moves under each
+    permutation (or -1 if the permuted edge would run from a higher
+    to a lower node, which no enumerated key can match anyway)"""
     cdef int numbits = n*(n-1) // 2
     cdef int everything = (1<<n) - 1
-    done = set()
+    cdef int totalbits = numbits + n
+    cdef unsigned long long maxkey = 1ULL << totalbits
     cdef int maxi = 1<<numbits
-    cdef int i, j, ignore, mask, childless = 0
-    cdef int connectedA, oldconnectedA, ipar, obs
+    cdef int i, j, c, p, b, obs, tgt, pi, bit, ok
+    cdef int childless = 0, connectedA, oldconnectedA, ipar, inodes
+    cdef unsigned long long key, src, out
+    cdef int sigma[32]
+    cdef int par_c[32]
+
+    perms = list(itertools.permutations(range(n)))
+    cdef int nperms = len(perms)
+    cdef int *perm_map = <int *> malloc(nperms * totalbits * sizeof(int))
+    cdef unsigned char *done = \
+        <unsigned char *> malloc(<size_t> (maxkey // 8 + 1))
+    if perm_map == NULL or done == NULL:
+        free(perm_map)
+        free(done)
+        raise MemoryError()
+    memset(done, 0, <size_t> (maxkey // 8 + 1))
+
+    for pi, perm in enumerate(perms):
+        # perm[new] = old, so sigma maps old node numbers to new
+        for j in range(n):
+            sigma[perm[j]] = j
+        for j in range(n): # observability bits
+            perm_map[pi*totalbits + j] = sigma[j]
+        for c in range(n): # edge bits: parent p of child c
+            for p in range(c):
+                b = n + c*(c-1)//2 + p
+                if sigma[p] < sigma[c]:
+                    perm_map[pi*totalbits + b] = \
+                        n + sigma[c]*(sigma[c]-1)//2 + sigma[p]
+                else:
+                    perm_map[pi*totalbits + b] = -1
+
     trythese = set()
 
-    for i in range(maxi):
-        par = []
-        for j in range(n):
-            ignore = j*(j-1) // 2
-            mask = (1<<j) - 1
-            par.append((i>>ignore) & mask)
-        par = tuple(par)
+    try:
+        for i in range(maxi):
+            for j in range(n):
+                par_c[j] = (i >> (j*(j-1) // 2)) & ((1<<j) - 1)
 
-        if irrcheck:
-            childless = everything
-            for i in par:
-                childless &= ~i
-
-            # Appendix D.1, 1: disconnected DAGs don't tell us more than
-            # each component does
-            connectedA = 1
-            oldconnectedA = 0
-            while connectedA != oldconnectedA:
-                oldconnectedA = connectedA
-                for i, ipar in enumerate(par):
-                    inodes = ipar | (1<<i)
-                    if inodes & connectedA:
-                        connectedA |= inodes
-            if connectedA != everything:
-                continue
-
-        for obs in range(1<<n):
             if irrcheck:
-                # Appendix D.1, 2: Childless unobserved nodes are
-                # pointless
-                if childless & ~obs:
+                childless = everything
+                for j in range(n):
+                    childless &= ~par_c[j]
+
+                # Appendix D.1, 1: disconnected DAGs don't tell us more
+                # than each component does
+                connectedA = 1
+                oldconnectedA = 0
+                while connectedA != oldconnectedA:
+                    oldconnectedA = connectedA
+                    for j in range(n):
+                        inodes = par_c[j] | (1<<j)
+                        if inodes & connectedA:
+                            connectedA |= inodes
+                if connectedA != everything:
                     continue
 
-                # Appendix D.1, 3: "Schrodinger picture": if an
-                # unobserved node only has one parent, and its
-                # unobserved, just apply channel to parent
-                if any([par[i] & (par[i] - 1) == 0 and par[i] & ~obs for
-                        i in bitsof(everything & ~obs)]):
+            par = None
+            for obs in range(1<<n):
+                if irrcheck:
+                    # Appendix D.1, 2: Childless unobserved nodes are
+                    # pointless
+                    if childless & ~obs:
+                        continue
+
+                    # Appendix D.1, 3: "Schrodinger picture": if an
+                    # unobserved node only has one parent, and its
+                    # unobserved, just apply channel to parent
+                    ok = 1
+                    for j in range(n):
+                        if not ((1<<j) & obs):
+                            ipar = par_c[j]
+                            if ipar & (ipar - 1) == 0 and ipar & ~obs:
+                                ok = 0
+                                break
+                    if not ok:
+                        continue
+
+                key = (<unsigned long long> i << n) | <unsigned int> obs
+                if done[key >> 3] & (1 << (key & 7)):
                     continue
 
-            if donethis(n, par, obs, done):
-                continue
-            done.add((par,obs))
+                # New isomorphism class: mark every permuted form
+                for pi in range(nperms):
+                    src = key
+                    out = 0
+                    ok = 1
+                    while src:
+                        bit = _ctz(src)
+                        src &= src - 1
+                        tgt = perm_map[pi*totalbits + bit]
+                        if tgt < 0:
+                            ok = 0
+                            break
+                        out |= 1ULL << tgt
+                    if ok:
+                        done[out >> 3] |= 1 << (out & 7)
 
-            trythese.add((n, par, obs))
+                if par is None:
+                    par = tuple([par_c[j] for j in range(n)])
+                trythese.add((n, par, obs))
+    finally:
+        free(perm_map)
+        free(done)
 
     return trythese
 
@@ -381,7 +441,9 @@ def enumdags(int n, int numprocesses):
     GDAGs of size n, using numprocesses processes in parallel"""
     trythese = find_candidates(n, True)
     pool = multiprocessing.Pool(processes=numprocesses)
-    res = pool.imap_unordered(trydag, trythese)
+    # sorted + chunksize keeps same-par GDAGs in the same worker, so
+    # each worker's closure cache gets hits
+    res = pool.imap_unordered(trydag, sorted(trythese), chunksize=64)
     for x in res:
         if x is not None:
             (n, par, obs) = x
@@ -392,7 +454,8 @@ def enumdags_reducible(int n, int numprocesses):
     GDAGs of size n, using numprocesses processes in parallel"""
     trythese = find_candidates(n, False)
     pool = multiprocessing.Pool(processes=numprocesses)
-    res = pool.imap_unordered(trydag_reducible, trythese)
+    res = pool.imap_unordered(trydag_reducible, sorted(trythese),
+                              chunksize=64)
     for x in res:
         if x is not None:
             (n, par, obs) = x
@@ -404,5 +467,6 @@ def countdags(int n, int numprocesses):
     processes in parallel"""
     trythese = find_candidates(n, False)
     pool = multiprocessing.Pool(processes=numprocesses)
-    res = pool.imap_unordered(trydag_count, trythese)
+    res = pool.imap_unordered(trydag_count, sorted(trythese),
+                              chunksize=64)
     print(n, len(trythese), sum(res))
