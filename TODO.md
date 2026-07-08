@@ -1,0 +1,2 @@
+- Package, cli
+- Run n=7 somewhere
